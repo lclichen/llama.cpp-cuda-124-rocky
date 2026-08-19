@@ -118,8 +118,9 @@ jobs:
               -DGGML_NATIVE=OFF \
               -DLLAMA_BUILD_TESTS=OFF \
               -DLLAMA_BUILD_EXAMPLES=OFF \
-              -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
-              -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
+              # 修复点：为 GCC 8 显式链接 stdc++fs 以支持 C++17 filesystem
+              -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs -lstdc++fs' \
+              -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs -lstdc++fs'
             
             echo '=== Building with Ninja ==='
             cmake --build build --config Release -j\$(nproc)
