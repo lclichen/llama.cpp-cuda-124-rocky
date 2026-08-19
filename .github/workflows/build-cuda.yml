@@ -28,14 +28,12 @@ jobs:
       - name: Check for new llama.cpp release
         id: check
         run: |
-          # Get latest release from llama.cpp
           LATEST_RELEASE=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.tag_name')
           RELEASE_HASH=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.target_commitish')
           
           echo "Latest llama.cpp release: $LATEST_RELEASE"
           echo "Release hash: $RELEASE_HASH"
           
-          # Check if we've already built this release
           if git tag | grep -q "^${LATEST_RELEASE}$"; then
             echo "Release $LATEST_RELEASE already built"
             if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
@@ -55,18 +53,19 @@ jobs:
   build:
     needs: check-release
     if: needs.check-release.outputs.should_build == 'true'
-    runs-on: ${{ matrix.arch.runs_on }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         cuda_version: ['12.4.1']
-        arch:
-          - { suffix: amd64, runs_on: ubuntu-latest }
-          - { suffix: arm64, runs_on: ubuntu-24.04-arm }
         include:
           - cuda_version: '12.4.1'
             cuda_version_short: '12.4'
-            architectures: '75-virtual;80-virtual;86-virtual;89-virtual;90-virtual;100-virtual;120-virtual'
+            # 修正点：恢复 cudnn-devel 标签，确保开发环境完整
+            cuda_tag: '12.4.1-cudnn-devel-rockylinux8'
+            # 仅保留主流及常用架构，移除了 CUDA 12.4 不支持的 100/120
+            architectures: '75-virtual;80-virtual;86-virtual;89-virtual;90-virtual'
+            arch_suffix: 'amd64'
     
     steps:
       - name: Checkout
@@ -76,145 +75,93 @@ jobs:
         run: |
           echo "=== Initial Disk Space ==="
           df -h
-          
           echo "=== Removing unnecessary packages ==="
-          sudo apt-get remove -y '^aspnetcore-.*' || true
-          sudo apt-get remove -y '^dotnet-.*' --fix-missing || true
-          sudo apt-get remove -y '^llvm-.*' --fix-missing || true
-          sudo apt-get remove -y 'php.*' --fix-missing || true
-          sudo apt-get remove -y '^mongodb-.*' --fix-missing || true
-          sudo apt-get remove -y '^mysql-.*' --fix-missing || true
-          sudo apt-get remove -y azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri --fix-missing || true
-          sudo apt-get autoremove -y || true
-          sudo apt-get clean || true
-          
+          sudo apt-get remove -y '^aspnetcore-.*' '^dotnet-.*' '^llvm-.*' 'php.*' '^mongodb-.*' '^mysql-.*' azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri --fix-missing || true
+          sudo apt-get autoremove -y && sudo apt-get clean || true
           echo "=== Removing large directories ==="
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf /usr/share/swift
-          sudo rm -rf /usr/local/.ghcup
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          
-          # Clean docker system
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
           docker system prune -af || true
-          
           echo "=== After Cleanup ==="
           df -h
 
       - name: Build llama.cpp with CUDA
         run: |
-          # Choose the appropriate CUDA tag based on architecture
-          # NVIDIA does not provide official rockylinux8 CUDA images for arm64 (sbsa),
-          # so we fall back to ubuntu22.04 for arm64 builds.
-          if [ "${{ matrix.arch.suffix }}" = "amd64" ]; then
-            CUDA_TAG="12.4.1-cudnn-devel-rockylinux8"
-          else
-            CUDA_TAG="12.4.1-cudnn-devel-ubuntu22.04"
-          fi
+          docker pull nvidia/cuda:${{ matrix.cuda_tag }}
           
-          # Pull Docker image
-          docker pull nvidia/cuda:${CUDA_TAG}
+          docker run --rm -v $PWD:/workspace nvidia/cuda:${{ matrix.cuda_tag }} bash -c "
+            set -e
+            
+            echo '=== Installing minimal dependencies (Rocky Linux 8) ==='
+            dnf install -y epel-release
+            dnf update -y
+            dnf config-manager --set-enabled powertools
+            dnf install -y git cmake ninja-build gcc gcc-c++ make openssl-devel ca-certificates
+            dnf clean all
+            rm -rf /var/cache/dnf
+            
+            echo '=== Cloning llama.cpp ==='
+            cd /workspace
+            git clone --depth 1 --branch ${{ needs.check-release.outputs.release_tag }} https://github.com/ggml-org/llama.cpp.git || \
+              (git clone https://github.com/ggml-org/llama.cpp.git && cd llama.cpp && git checkout ${{ needs.check-release.outputs.release_hash }})
+            cd llama.cpp
+            
+            echo '=== Configuring build with Ninja ==='
+            export LIBRARY_PATH=\"/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}\"
+            ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+            
+            cmake -B build -S . \
+              -G Ninja \
+              -DGGML_CUDA=ON \
+              -DCMAKE_CUDA_ARCHITECTURES='${{ matrix.architectures }}' \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DBUILD_SHARED_LIBS=ON \
+              -DGGML_NATIVE=OFF \
+              -DLLAMA_BUILD_TESTS=OFF \
+              -DLLAMA_BUILD_EXAMPLES=OFF \
+              -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
+              -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
+            
+            echo '=== Building with Ninja ==='
+            cmake --build build --config Release -j\$(nproc)
+            
+            echo '=== Copying binaries ==='
+            cd /workspace
+            mkdir -p binaries/cuda-${{ matrix.cuda_version_short }}
+            cp -r llama.cpp/build/bin/* binaries/cuda-${{ matrix.cuda_version_short }}/
+            
+            # Strip 二进制文件以减小体积 (排除 .so 动态库文件)
+            find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name \"*.so*\" -exec strip {} \; 2>/dev/null || true
+
+            echo '=== Creating version info ==='
+            cat > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt << EOF
+          llama.cpp version: ${{ needs.check-release.outputs.release_tag }}
+          CUDA version: ${{ matrix.cuda_version }}
+          Base OS: Rocky Linux 8
+          Architectures: ${{ matrix.architectures }}
+          Build date: \$(date -u +%Y-%m-%d)
+          Build hash: ${{ needs.check-release.outputs.release_hash }}
+          EOF
+
+            echo '=== Build complete ==='
+            ls -lh binaries/cuda-${{ matrix.cuda_version_short }}/
+            rm -rf llama.cpp
+          "
           
-          # Run build in container
-          docker run --rm \
-            -v $PWD:/workspace \
-            nvidia/cuda:${CUDA_TAG} \
-            bash -c "
-              set -e
-              
-              echo '=== Installing minimal dependencies ==='
-              if [ \"${{ matrix.arch.suffix }}\" = \"amd64\" ]; then
-                # Rocky Linux 8 setup
-                dnf install -y epel-release
-                dnf update -y
-                dnf config-manager --set-enabled powertools
-                dnf install -y git cmake ninja-build gcc gcc-c++ make openssl-devel ca-certificates
-                dnf clean all
-                rm -rf /var/cache/dnf
-              else
-                # Ubuntu 22.04 setup (fallback for arm64)
-                apt-get update -qq
-                apt-get install -y --no-install-recommends git cmake ninja-build build-essential libssl-dev ca-certificates
-                apt-get clean
-                rm -rf /var/lib/apt/lists/*
-              fi
-              
-              echo '=== Cloning llama.cpp ==='
-              cd /workspace
-              git clone --depth 1 --branch ${{ needs.check-release.outputs.release_tag }} https://github.com/ggml-org/llama.cpp.git || \
-                (git clone https://github.com/ggml-org/llama.cpp.git && cd llama.cpp && git checkout ${{ needs.check-release.outputs.release_hash }})
-              cd llama.cpp
-              
-              echo '=== Configuring build with Ninja ==='
-              export LIBRARY_PATH=\"/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}\"
-
-              ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
-              cmake -B build -S . \
-                -G Ninja \
-                -DGGML_CUDA=ON \
-                -DCMAKE_CUDA_ARCHITECTURES='${{ matrix.architectures }}' \
-                -DCMAKE_BUILD_TYPE=Release \
-                -DBUILD_SHARED_LIBS=ON \
-                -DGGML_NATIVE=OFF \
-                -DLLAMA_BUILD_TESTS=OFF \
-                -DLLAMA_BUILD_EXAMPLES=OFF \
-                -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
-                -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
-              
-              echo '=== Building with Ninja (parallel: all cores) ==='
-              cmake --build build --config Release -j\$(nproc)
-              
-              echo '=== Copying binaries ==='
-              cd /workspace
-              mkdir -p binaries/cuda-${{ matrix.cuda_version_short }}
-
-              # Copy everything from build/bin
-              cp -r llama.cpp/build/bin/* binaries/cuda-${{ matrix.cuda_version_short }}/
-
-              # Strip binaries to reduce size (executables only, not .so files)
-              find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name \"*.so*\" -exec strip {} \; 2>/dev/null || true
-
-              echo '=== Creating version info ==='
-              echo 'llama.cpp version: ${{ needs.check-release.outputs.release_tag }}' > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              echo 'CUDA version: ${{ matrix.cuda_version }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              if [ \"${{ matrix.arch.suffix }}\" = \"amd64\" ]; then
-                echo 'Base OS: Rocky Linux 8' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              else
-                echo 'Base OS: Ubuntu 22.04' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              fi
-              echo 'Architectures: ${{ matrix.architectures }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              echo 'Build date: '$(date -u +%Y-%m-%d) >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              echo 'Build hash: ${{ needs.check-release.outputs.release_hash }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-
-              echo '=== Build complete ==='
-              ls -lh binaries/cuda-${{ matrix.cuda_version_short }}/
-              
-              echo '=== Cleaning up build directory ==='
-              rm -rf llama.cpp
-            "
-          
-          # Remove Docker image to free space
-          docker rmi nvidia/cuda:${CUDA_TAG} || true
-          
-          # Fix permissions for files created by root in container
+          docker rmi nvidia/cuda:${{ matrix.cuda_tag }} || true
           sudo chown -R $(id -u):$(id -g) $PWD
-          
           echo "=== Final disk usage ==="
           df -h
 
       - name: Create tarball
         run: |
           cd binaries
-          tar -czf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}.tar.gz cuda-${{ matrix.cuda_version_short }}
+          tar -czf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch_suffix }}.tar.gz cuda-${{ matrix.cuda_version_short }}
           ls -lh *.tar.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: llama.cpp-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}
+          name: llama.cpp-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch_suffix }}
           path: binaries/*.tar.gz
           retention-days: 1
 
@@ -246,8 +193,7 @@ jobs:
           TAG="${{ needs.check-release.outputs.release_tag }}"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit --allow-empty \
-            -m "llama.cpp ${TAG} (CUDA build $(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git commit --allow-empty -m "llama.cpp ${TAG} (CUDA 12.4 Rocky8 build $(date -u +%Y-%m-%dT%H:%M:%SZ))"
           git tag "${TAG}"
           git push origin "refs/tags/${TAG}"
 
@@ -255,39 +201,32 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ needs.check-release.outputs.release_tag }}
-          name: llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA
+          name: llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA 12.4 (Rocky Linux 8)
           body: |
-            # llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA Support
+            # llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA 12.4 Support
             
-            Pre-built binaries of llama.cpp with CUDA support.
+            Pre-built binaries of llama.cpp with CUDA support, optimized for x86_64 Linux environments.
             
             **Source:** https://github.com/ggml-org/llama.cpp/releases/tag/${{ needs.check-release.outputs.release_tag }}
             **Commit:** ${{ needs.check-release.outputs.release_hash }}
             
-            ## Environment & CUDA Versions
-            - **CUDA 12.4.1** - GPU compute capabilities: 7.5, 8.0, 8.6, 8.9, 9.0, 10.0, 12.0
-
-            ## Host architectures & Base OS
-            Tarballs are published per host CPU architecture (Linux):
-            - `-amd64.tar.gz` — x86_64 (Compiled on **Rocky Linux 8.6** for maximum RHEL/Rocky/AlmaLinux compatibility)
-            - `-arm64.tar.gz` — aarch64 (Compiled on Ubuntu 22.04 as a fallback, since NVIDIA does not provide official Rocky Linux 8 CUDA images for ARM64)
-
+            ## Build Environment
+            - **CUDA Version:** 12.4.1 (with cuDNN)
+            - **Base OS:** Rocky Linux 8 (Ensures maximum compatibility with RHEL 8, AlmaLinux 8, CentOS Stream 8, etc.)
+            - **GPU Compute Capabilities:** 7.5, 8.0, 8.6, 8.9, 9.0 (with `-virtual` PTX for forward compatibility)
+            
             ## GPU compute capability reference
             - 7.5: Tesla T4, RTX 20xx series, Quadro RTX
             - 8.0: A100
             - 8.6: RTX 3000 series
             - 8.9: RTX 4000 series, L4, L40
             - 9.0: H100, H200, GH200
-            - 10.0: B200, GB200
-            - 12.0: RTX Pro series, RTX 50xx
 
             ## Usage
-            Download the tarball matching your host CPU arch and CUDA version, then extract:
+            Download the tarball and extract:
             ```bash
-            # amd64 host
             tar -xzf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-12.4-amd64.tar.gz
-            # arm64 host (e.g. Grace Blackwell)
-            tar -xzf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-12.4-arm64.tar.gz
+            cd cuda-12.4
             ./llama-cli --help
             ```
           files: release-assets/*
