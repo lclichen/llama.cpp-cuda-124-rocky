@@ -109,6 +109,8 @@ jobs:
             export LIBRARY_PATH=\"/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}\"
             ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
             
+            # 修复点：GCC 8 需要显式链接 stdc++fs，且必须放在链接命令末尾
+            export CXXFLAGS="-std=c++17"
             cmake -B build -S . \
               -G Ninja \
               -DGGML_CUDA=ON \
@@ -118,8 +120,9 @@ jobs:
               -DGGML_NATIVE=OFF \
               -DLLAMA_BUILD_TESTS=OFF \
               -DLLAMA_BUILD_EXAMPLES=OFF \
-              -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs -lstdc++fs' \
-              -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs -lstdc++fs'
+              -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
+              -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
+              -DCMAKE_CXX_STANDARD_LIBRARIES='-lstdc++fs'
             
             echo '=== Building with Ninja ==='
             cmake --build build --config Release -j\$(nproc)
