@@ -104,7 +104,7 @@ jobs:
             # 启用 GCC 11 环境（必须在同一个 shell session 中）
             source /opt/rh/gcc-toolset-11/enable
             
-            echo "=== Using GCC version: $(gcc --version | head -1) ==="
+            echo '=== Using GCC version: $(gcc --version | head -1) ==='
             
             echo '=== Cloning llama.cpp ==='
             cd /workspace
@@ -113,7 +113,7 @@ jobs:
             cd llama.cpp
             
             echo '=== Configuring build with Ninja ==='
-            export LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}"
+            export LIBRARY_PATH=\"/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}\"
             ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
             
             cmake -B build -S . \
