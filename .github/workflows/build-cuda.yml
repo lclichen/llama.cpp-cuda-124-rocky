@@ -95,9 +95,16 @@ jobs:
             dnf install -y epel-release
             dnf update -y
             dnf config-manager --set-enabled powertools
-            dnf install -y git cmake ninja-build gcc gcc-c++ make openssl-devel ca-certificates
+            # 安装 gcc-toolset-11 以获得完整的 C++17/CTAD 支持
+            dnf install -y gcc-toolset-11-gcc gcc-toolset-11-gcc-c++ gcc-toolset-11-libstdc++-devel
+            dnf install -y git cmake ninja-build make openssl-devel ca-certificates
             dnf clean all
             rm -rf /var/cache/dnf
+            
+            # 启用 GCC 11 环境（必须在同一个 shell session 中）
+            source /opt/rh/gcc-toolset-11/enable
+            
+            echo "=== Using GCC version: $(gcc --version | head -1) ==="
             
             echo '=== Cloning llama.cpp ==='
             cd /workspace
@@ -106,11 +113,9 @@ jobs:
             cd llama.cpp
             
             echo '=== Configuring build with Ninja ==='
-            export LIBRARY_PATH=\"/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}\"
+            export LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}"
             ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
             
-            # 修复点：GCC 8 需要显式链接 stdc++fs，且必须放在链接命令末尾
-            export CXXFLAGS="-std=c++17"
             cmake -B build -S . \
               -G Ninja \
               -DGGML_CUDA=ON \
@@ -121,8 +126,7 @@ jobs:
               -DLLAMA_BUILD_TESTS=OFF \
               -DLLAMA_BUILD_EXAMPLES=OFF \
               -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
-              -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
-              -DCMAKE_CXX_STANDARD_LIBRARIES='-lstdc++fs'
+              -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
             
             echo '=== Building with Ninja ==='
             cmake --build build --config Release -j\$(nproc)
