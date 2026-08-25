@@ -2,7 +2,6 @@ name: Build llama.cpp with CUDA
 
 on:
   schedule:
-    # Run daily at 00:00 UTC
     - cron: '0 0 * * *'
   workflow_dispatch:
     inputs:
@@ -41,7 +40,6 @@ jobs:
           if git tag | grep -q "^${LATEST_RELEASE}$"; then
             echo "Release $LATEST_RELEASE already built"
             if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
-              echo "Force build enabled, building anyway"
               echo "should_build=true" >> $GITHUB_OUTPUT
             else
               echo "should_build=false" >> $GITHUB_OUTPUT
@@ -53,100 +51,57 @@ jobs:
           echo "release_tag=$LATEST_RELEASE" >> $GITHUB_OUTPUT
           echo "release_hash=$RELEASE_HASH" >> $GITHUB_OUTPUT
 
-  build:
+  # ============================================================
+  # Mainline build (原有逻辑完全保留)
+  # ============================================================
+  build-mainline:
     needs: check-release
-    if: needs.check-release.outputs.should_build == 'true' || github.event.inputs.build_unsloth == 'true'
+    if: needs.check-release.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         cuda_version: ['12.4.1']
-        variant: ['mainline', 'unsloth']
         include:
           - cuda_version: '12.4.1'
             cuda_version_short: '12.4'
             cuda_tag: '12.4.1-cudnn-devel-rockylinux8'
             architectures: '75-virtual;80-virtual;86-virtual;89-virtual;90-virtual'
             arch_suffix: 'amd64'
-
-          # === Mainline 配置（原有逻辑不变）===
-          - variant: 'mainline'
-            repo_url: 'https://github.com/ggml-org/llama.cpp.git'
-            clone_branch: ''  # 使用 release tag checkout
-            artifact_label: 'cuda'
-            display_name: 'Mainline'
-
-          # === Unsloth iq1-narrow 配置（新增）===
-          - variant: 'unsloth'
-            repo_url: 'https://github.com/unslothai/llama.cpp.git'
-            clone_branch: 'iq1-narrow'
-            artifact_label: 'cuda-unsloth'
-            display_name: 'Unsloth (Qwen3.8-UD)'
-
-    # 跳过条件：mainline 遵循原有 release 检查；unsloth 由手动开关或 force_build 控制
-    if: |
-      (matrix.variant == 'mainline' && needs.check-release.outputs.should_build == 'true') ||
-      (matrix.variant == 'unsloth' && (github.event.inputs.build_unsloth == 'true' || github.event.inputs.force_build == 'true'))
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Maximize build space
         run: |
-          echo "=== Initial Disk Space ==="
           df -h
-          echo "=== Removing unnecessary packages ==="
           sudo apt-get remove -y '^aspnetcore-.*' '^dotnet-.*' '^llvm-.*' 'php.*' '^mongodb-.*' '^mysql-.*' azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri --fix-missing || true
           sudo apt-get autoremove -y && sudo apt-get clean || true
-          echo "=== Removing large directories ==="
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
           docker system prune -af || true
-          echo "=== After Cleanup ==="
           df -h
 
-      - name: Build llama.cpp with CUDA (${{ matrix.display_name }})
+      - name: Build llama.cpp Mainline with CUDA
         run: |
           docker pull nvidia/cuda:${{ matrix.cuda_tag }}
           docker run --rm -v $PWD:/workspace nvidia/cuda:${{ matrix.cuda_tag }} bash -c "
             set -e
-
-            echo '=== Installing minimal dependencies (Rocky Linux 8) ==='
-            dnf install -y epel-release
-            dnf update -y
+            dnf install -y epel-release && dnf update -y
             dnf config-manager --set-enabled powertools
             dnf install -y gcc-toolset-11-gcc gcc-toolset-11-gcc-c++ gcc-toolset-11-libstdc++-devel
             dnf install -y git cmake ninja-build make openssl-devel ca-certificates
-            dnf clean all
-            rm -rf /var/cache/dnf
-
+            dnf clean all && rm -rf /var/cache/dnf
             source /opt/rh/gcc-toolset-11/enable
-            echo '=== Using GCC version: \$(gcc --version | head -1) ==='
 
-            echo '=== Cloning llama.cpp (${{ matrix.display_name }}) ==='
             cd /workspace
+            git clone --depth 1 --branch ${{ needs.check-release.outputs.release_tag }} https://github.com/ggml-org/llama.cpp.git || \
+              (git clone https://github.com/ggml-org/llama.cpp.git && cd llama.cpp && git checkout ${{ needs.check-release.outputs.release_hash }})
+            cd llama.cpp
 
-            # === 关键分支逻辑：根据 variant 选择不同的克隆策略 ===
-            if [ '${{ matrix.variant }}' = 'unsloth' ]; then
-              echo 'Cloning Unsloth iq1-narrow branch...'
-              git clone --depth 1 --branch ${{ matrix.clone_branch }} ${{ matrix.repo_url }} llama.cpp
-              cd llama.cpp
-              UNSLOTH_COMMIT=\$(git rev-parse HEAD)
-              VERSION_LABEL='unsloth-iq1-narrow-\$(date -u +%Y%m%d)-\${UNSLOTH_COMMIT:0:7}'
-            else
-              echo 'Cloning mainline release ${{ needs.check-release.outputs.release_tag }}...'
-              git clone --depth 1 --branch ${{ needs.check-release.outputs.release_tag }} ${{ matrix.repo_url }} || \
-                (git clone ${{ matrix.repo_url }} && cd llama.cpp && git checkout ${{ needs.check-release.outputs.release_hash }})
-              cd llama.cpp
-              VERSION_LABEL='${{ needs.check-release.outputs.release_tag }}'
-            fi
-
-            echo '=== Configuring build with Ninja ==='
             export LIBRARY_PATH=\"/usr/local/cuda/lib64/stubs\${LIBRARY_PATH:+:\$LIBRARY_PATH}\"
             ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
 
-            cmake -B build -S . \
-              -G Ninja \
+            cmake -B build -S . -G Ninja \
               -DGGML_CUDA=ON \
               -DCMAKE_CUDA_ARCHITECTURES='${{ matrix.architectures }}' \
               -DCMAKE_BUILD_TYPE=Release \
@@ -157,52 +112,143 @@ jobs:
               -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
               -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
 
-            echo '=== Building with Ninja ==='
             cmake --build build --config Release -j\$(nproc)
 
-            echo '=== Copying binaries ==='
             cd /workspace
-            mkdir -p binaries/${{ matrix.artifact_label }}-${{ matrix.cuda_version_short }}
-            cp -r llama.cpp/build/bin/* binaries/${{ matrix.artifact_label }}-${{ matrix.cuda_version_short }}/
+            mkdir -p binaries/cuda-${{ matrix.cuda_version_short }}
+            cp -r llama.cpp/build/bin/* binaries/cuda-${{ matrix.cuda_version_short }}/
+            find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name '*.so*' -exec strip {} \; 2>/dev/null || true
 
-            find binaries/${{ matrix.artifact_label }}-${{ matrix.cuda_version_short }}/ -type f -executable ! -name '*.so*' -exec strip {} \; 2>/dev/null || true
-
-            echo '=== Creating version info ==='
-            cat > binaries/${{ matrix.artifact_label }}-${{ matrix.cuda_version_short }}/VERSION.txt << EOF
-          Variant: ${{ matrix.display_name }}
-          Version: \${VERSION_LABEL}
-          CUDA version: ${{ matrix.cuda_version }}
-          Base OS: Rocky Linux 8
-          Architectures: ${{ matrix.architectures }}
-          Build date: \$(date -u +%Y-%m-%d)
+            cat > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt << EOF
+          Variant: Mainline
+          Version: ${{ needs.check-release.outputs.release_tag }}
+          CUDA: ${{ matrix.cuda_version }}
+          OS: Rocky Linux 8
+          Archs: ${{ matrix.architectures }}
+          Date: \$(date -u +%Y-%m-%d)
+          Hash: ${{ needs.check-release.outputs.release_hash }}
           EOF
-
-            echo '=== Build complete ==='
-            ls -lh binaries/${{ matrix.artifact_label }}-${{ matrix.cuda_version_short }}/
+            ls -lh binaries/cuda-${{ matrix.cuda_version_short }}/
             rm -rf llama.cpp
           "
-
           docker rmi nvidia/cuda:${{ matrix.cuda_tag }} || true
           sudo chown -R \$(id -u):\$(id -g) \$PWD
-          echo '=== Final disk usage ==='
-          df -h
 
       - name: Create tarball
         run: |
           cd binaries
-          TARBALL_NAME=\"llama.cpp-${{ matrix.artifact_label }}-${{ matrix.cuda_version_short }}-${{ matrix.arch_suffix }}.tar.gz\"
-          tar -czf \"\$TARBALL_NAME\" ${{ matrix.artifact_label }}-${{ matrix.cuda_version_short }}
+          tar -czf llama.cpp-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch_suffix }}.tar.gz cuda-${{ matrix.cuda_version_short }}
           ls -lh *.tar.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: llama.cpp-${{ matrix.artifact_label }}-${{ matrix.cuda_version_short }}-${{ matrix.arch_suffix }}
+          name: llama.cpp-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch_suffix }}
           path: binaries/*.tar.gz
           retention-days: 7
 
+  # ============================================================
+  # Unsloth iq1-narrow build (新增，独立 job)
+  # ============================================================
+  build-unsloth:
+    needs: check-release
+    if: github.event.inputs.build_unsloth == 'true' || github.event.inputs.force_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda_version: ['12.4.1']
+        include:
+          - cuda_version: '12.4.1'
+            cuda_version_short: '12.4'
+            cuda_tag: '12.4.1-cudnn-devel-rockylinux8'
+            architectures: '75-virtual;80-virtual;86-virtual;89-virtual;90-virtual'
+            arch_suffix: 'amd64'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Maximize build space
+        run: |
+          df -h
+          sudo apt-get remove -y '^aspnetcore-.*' '^dotnet-.*' '^llvm-.*' 'php.*' '^mongodb-.*' '^mysql-.*' azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri --fix-missing || true
+          sudo apt-get autoremove -y && sudo apt-get clean || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+          docker system prune -af || true
+          df -h
+
+      - name: Build Unsloth iq1-narrow with CUDA
+        run: |
+          docker pull nvidia/cuda:${{ matrix.cuda_tag }}
+          docker run --rm -v $PWD:/workspace nvidia/cuda:${{ matrix.cuda_tag }} bash -c "
+            set -e
+            dnf install -y epel-release && dnf update -y
+            dnf config-manager --set-enabled powertools
+            dnf install -y gcc-toolset-11-gcc gcc-toolset-11-gcc-c++ gcc-toolset-11-libstdc++-devel
+            dnf install -y git cmake ninja-build make openssl-devel ca-certificates
+            dnf clean all && rm -rf /var/cache/dnf
+            source /opt/rh/gcc-toolset-11/enable
+
+            cd /workspace
+            echo '=== Cloning Unsloth iq1-narrow ==='
+            git clone --depth 1 --branch iq1-narrow https://github.com/unslothai/llama.cpp.git llama.cpp
+            cd llama.cpp
+            UNSLOTH_COMMIT=\$(git rev-parse HEAD)
+
+            export LIBRARY_PATH=\"/usr/local/cuda/lib64/stubs\${LIBRARY_PATH:+:\$LIBRARY_PATH}\"
+            ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+
+            cmake -B build -S . -G Ninja \
+              -DGGML_CUDA=ON \
+              -DCMAKE_CUDA_ARCHITECTURES='${{ matrix.architectures }}' \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DBUILD_SHARED_LIBS=ON \
+              -DGGML_NATIVE=OFF \
+              -DLLAMA_BUILD_TESTS=OFF \
+              -DLLAMA_BUILD_EXAMPLES=OFF \
+              -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
+              -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
+
+            cmake --build build --config Release -j\$(nproc)
+
+            cd /workspace
+            mkdir -p binaries/cuda-unsloth-${{ matrix.cuda_version_short }}
+            cp -r llama.cpp/build/bin/* binaries/cuda-unsloth-${{ matrix.cuda_version_short }}/
+            find binaries/cuda-unsloth-${{ matrix.cuda_version_short }}/ -type f -executable ! -name '*.so*' -exec strip {} \; 2>/dev/null || true
+
+            cat > binaries/cuda-unsloth-${{ matrix.cuda_version_short }}/VERSION.txt << EOF
+          Variant: Unsloth iq1-narrow (Qwen3.8-UD)
+          Commit: \${UNSLOTH_COMMIT}
+          CUDA: ${{ matrix.cuda_version }}
+          OS: Rocky Linux 8
+          Archs: ${{ matrix.architectures }}
+          Date: \$(date -u +%Y-%m-%d)
+          EOF
+            ls -lh binaries/cuda-unsloth-${{ matrix.cuda_version_short }}/
+            rm -rf llama.cpp
+          "
+          docker rmi nvidia/cuda:${{ matrix.cuda_tag }} || true
+          sudo chown -R \$(id -u):\$(id -g) \$PWD
+
+      - name: Create tarball
+        run: |
+          cd binaries
+          tar -czf llama.cpp-cuda-unsloth-${{ matrix.cuda_version_short }}-${{ matrix.arch_suffix }}.tar.gz cuda-unsloth-${{ matrix.cuda_version_short }}
+          ls -lh *.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama.cpp-cuda-unsloth-${{ matrix.cuda_version_short }}-${{ matrix.arch_suffix }}
+          path: binaries/*.tar.gz
+          retention-days: 7
+
+  # ============================================================
+  # Release (合并两个 job 的产物)
+  # ============================================================
   release:
-    needs: [check-release, build]
+    needs: [check-release, build-mainline, build-unsloth]
+    if: always() && (needs.build-mainline.result == 'success' || needs.build-unsloth.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -224,45 +270,34 @@ jobs:
           ls -lh release-assets/
 
       - name: Create advancing release tag
+        if: needs.build-mainline.result == 'success'
         run: |
           set -euo pipefail
-          TAG=\"${{ needs.check-release.outputs.release_tag }}\"
+          TAG="${{ needs.check-release.outputs.release_tag }}"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit --allow-empty -m \"llama.cpp \${TAG} (CUDA 12.4 Rocky8 build \$(date -u +%Y-%m-%dT%H:%M:%SZ))\"
-          git tag \"\${TAG}\"
-          git push origin \"refs/tags/\${TAG}\"
+          git commit --allow-empty -m "llama.cpp ${TAG} (CUDA 12.4 Rocky8 build $(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git tag "${TAG}"
+          git push origin "refs/tags/${TAG}"
 
       - name: Create Release
+        if: needs.build-mainline.result == 'success'
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ needs.check-release.outputs.release_tag }}
           name: llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA 12.4 (Rocky Linux 8)
           body: |
-            # llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA 12.4 Support
-
-            Pre-built binaries of llama.cpp with CUDA support, optimized for x86_64 Linux environments.
+            # llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA 12.4
 
             ## Variants
+            | File | Description |
+            |------|-------------|
+            | `*-cuda-12.4-amd64.tar.gz` | Official mainline release |
+            | `*-cuda-unsloth-12.4-amd64.tar.gz` | Unsloth `iq1-narrow` for **Qwen3.8-UD** |
 
-            | Variant | Description | Use Case |
-            |---------|-------------|----------|
-            | **Mainline** | Official ggml-org/llama.cpp release | Standard models (Qwen, Llama, etc.) |
-            | **Unsloth** | `iq1-narrow` branch from unslothai/llama.cpp | **Qwen3.8-UD** hybrid architecture (Gated Delta Net GPU kernel) |
-
-            ## Build Environment
-            - **CUDA Version:** 12.4.1 (with cuDNN)
-            - **Base OS:** Rocky Linux 8
-            - **GPU Compute Capabilities:** 7.5, 8.0, 8.6, 8.9, 9.0
-
-            ## Usage
-            ```bash
-            # Mainline
-            tar -xzf llama.cpp-cuda-12.4-amd64.tar.gz
-
-            # Unsloth (for Qwen3.8-UD)
-            tar -xzf llama.cpp-cuda-unsloth-12.4-amd64.tar.gz
-            ```
+            ## Build Info
+            - CUDA 12.4.1 + cuDNN, Rocky Linux 8
+            - Architectures: 7.5, 8.0, 8.6, 8.9, 9.0
           files: release-assets/*
           draft: false
           prerelease: false
