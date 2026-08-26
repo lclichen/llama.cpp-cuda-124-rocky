@@ -132,7 +132,9 @@ jobs:
             rm -rf llama.cpp
           "
           docker rmi nvidia/cuda:${{ matrix.cuda_tag }} || true
-          sudo chown -R \$(id -u):\$(id -g) \$PWD
+          sudo chown -R $(id -u):$(id -g) $PWD
+          echo "=== Final disk usage ==="
+          df -h
 
       - name: Create tarball
         run: |
@@ -228,7 +230,10 @@ jobs:
             rm -rf llama.cpp
           "
           docker rmi nvidia/cuda:${{ matrix.cuda_tag }} || true
-          sudo chown -R \$(id -u):\$(id -g) \$PWD
+          sudo chown -R $(id -u):$(id -g) $PWD
+          echo "=== Final disk usage ==="
+          df -h
+          
 
       - name: Create tarball
         run: |
